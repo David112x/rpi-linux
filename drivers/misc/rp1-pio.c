@@ -609,11 +609,12 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 	struct rp1_pio_sm_set_dmactrl_args set_dmactrl_args;
 	struct rp1_pio_device *pio = client->pio;
 	struct platform_device *pdev = pio->pdev;
-	struct device *dev = &pdev->dev;
 	struct dma_slave_config config = {};
+	struct device *dev = &pdev->dev;
 	struct dma_slave_caps dma_caps;
+	struct dma_info *dma = NULL;
+	bool reconfigure = false;
 	phys_addr_t fifo_addr;
-	struct dma_info *dma;
 	uint32_t dma_mask;
 	char chan_name[4];
 	int ret = 0;
@@ -627,14 +628,21 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 
 	dma_mask = 1 << (sm * 2 + dir);
 
-	dma = &pio->dma_configs[sm][dir];
-
 	spin_lock(&pio->lock);
-	if (pio->claimed_dmas & dma_mask)
-		rp1_pio_sm_dma_free(dev, dma);
-	pio->claimed_dmas |= dma_mask;
-	client->claimed_dmas |= dma_mask;
+	if (!(pio->claimed_dmas & dma_mask & ~client->claimed_dmas)) {
+		dma = &pio->dma_configs[sm][dir];
+		if (client->claimed_dmas & dma_mask)
+			reconfigure = true;
+		pio->claimed_dmas |= dma_mask;
+		client->claimed_dmas |= dma_mask;
+	}
 	spin_unlock(&pio->lock);
+	if (!dma)
+		return -EBUSY;
+
+	/* dma_release_channel() sleeps, so free the old channel outside the lock. */
+	if (reconfigure)
+		rp1_pio_sm_dma_free(dev, dma);
 
 	dma->buf_size = buf_size;
 	/* Round up the allocations */
@@ -873,13 +881,20 @@ static int rp1_pio_sm_xfer_data32_user(struct rp1_pio_client *client, void *para
 {
 	struct rp1_pio_sm_xfer_data32_args *args = param;
 	struct rp1_pio_device *pio = client->pio;
-	struct dma_info *dma;
+	struct dma_info *dma = NULL;
+	uint32_t dma_mask;
 
 	if (args->sm >= RP1_PIO_SMS_COUNT || args->dir >= RP1_PIO_DIR_COUNT ||
 	    !args->data_bytes || !args->data)
 		return -EINVAL;
 
-	dma = &pio->dma_configs[args->sm][args->dir];
+	dma_mask = 1 << (args->sm * 2 + args->dir);
+	spin_lock(&pio->lock);
+	if (client->claimed_dmas & dma_mask)
+		dma = &pio->dma_configs[args->sm][args->dir];
+	spin_unlock(&pio->lock);
+	if (!dma)
+		return -EINVAL;
 
 	if (args->dir == RP1_PIO_DIR_TO_SM)
 		return rp1_pio_sm_tx_user(pio, dma, args->data, args->data_bytes);
