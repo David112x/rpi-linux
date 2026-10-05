@@ -69,6 +69,10 @@
 #define HANDLER(_n, _f) \
 	[_IOC_NR(PIO_IOC_ ## _n)] = { #_n, rp1_pio_ ## _f, _IOC_SIZE(PIO_IOC_ ## _n) }
 
+/* A handler that records its progress in its args if it is interrupted */
+#define HANDLER_RESTARTABLE(_n, _f) \
+	[_IOC_NR(PIO_IOC_ ## _n)] = { #_n, rp1_pio_ ## _f, _IOC_SIZE(PIO_IOC_ ## _n), true }
+
 
 #define ROUND_UP(x, y) (((x) + (y) - 1) - (((x) + (y) - 1) % (y)))
 
@@ -95,6 +99,7 @@ struct dma_info {
 	struct dma_chan *chan;
 	size_t buf_size;
 	size_t buf_count;
+	size_t burst_bytes;
 	bool cyclic;
 	unsigned int head_idx;
 	unsigned int tail_idx;
@@ -961,18 +966,57 @@ static void rp1_pio_sm_kernel_dma_callback(void *param)
 	kfree(dxs);
 }
 
-static void rp1_pio_sm_dma_free(struct device *dev, struct dma_info *dma)
+/*
+ * Once the RX FIFO reaches its DMA threshold, the DMA request is held until
+ * the DMAC acknowledges a burst, even if the FIFO is emptied in the meantime.
+ * A request still held when the SM is released makes the next user's first
+ * burst read stale data from the empty FIFO, so retire it (and any data that
+ * is left) with a throwaway transfer. Only one request can be outstanding, and
+ * it is satisfied by whatever is at the head of the FIFO, so a full FIFO is the
+ * most that can be pending - the extra burst is just a margin. The SM must
+ * already be disabled, so that no new data can arrive and any bursts complete
+ * almost immediately; the transfer is then stopped, finished or not.
+ */
+static void rp1_pio_sm_dma_flush_rx(struct dma_info *dma)
 {
+	size_t len = RP1_PIO_FIFO_DEPTH * sizeof(uint32_t) + dma->burst_bytes;
+	struct device *dma_dev = dma->chan->device->dev;
+	struct dma_async_tx_descriptor *desc;
+	dma_addr_t dma_addr;
+	void *buf;
+
+	dmaengine_terminate_sync(dma->chan);
+
+	buf = dma_alloc_coherent(dma_dev, len, &dma_addr, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	desc = dmaengine_prep_slave_single(dma->chan, dma_addr, len,
+					   DMA_DEV_TO_MEM, DMA_CTRL_ACK);
+	if (desc && dmaengine_submit(desc) >= 0) {
+		dma_async_issue_pending(dma->chan);
+		fsleep(1000);
+	}
+
+	dmaengine_terminate_sync(dma->chan);
+	dma_free_coherent(dma_dev, len, buf, dma_addr);
+}
+
+static void rp1_pio_sm_dma_free(struct dma_info *dma)
+{
+	/* The buffers were allocated for the DMA controller, so free them there */
+	struct device *dma_dev = dma->chan->device->dev;
+
 	dmaengine_terminate_all(dma->chan);
 	if (dma->cyclic) {
 		dma->buf_count = 0;
-		dma_free_coherent(dev, ROUND_UP(dma->buf_size, PAGE_SIZE),
+		dma_free_coherent(dma_dev, ROUND_UP(dma->buf_size, PAGE_SIZE),
 				  dma->bufs[0].buf,
 				  dma->bufs[0].dma_addr);
 	} else {
 		while (dma->buf_count > 0) {
 			dma->buf_count--;
-			dma_free_coherent(dev, ROUND_UP(dma->buf_size, PAGE_SIZE),
+			dma_free_coherent(dma_dev, ROUND_UP(dma->buf_size, PAGE_SIZE),
 					  dma->bufs[dma->buf_count].buf,
 					  dma->bufs[dma->buf_count].dma_addr);
 		}
@@ -1027,7 +1071,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 
 	/* dma_release_channel() sleeps, so free the old channel outside the lock. */
 	if (reconfigure)
-		rp1_pio_sm_dma_free(dev, dma);
+		rp1_pio_sm_dma_free(dma);
 
 	sema_init(&dma->buf_sem, 0);
 
@@ -1057,7 +1101,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 
 	if (cyclic) {
 		dma->buf_size = buf_size * buf_count;
-		dma->buf_count = buf_count;
+		dma->buf_count = 0;
 		/* Round up the allocations */
 		buf_size = ROUND_UP(dma->buf_size, PAGE_SIZE);
 
@@ -1072,6 +1116,8 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 		}
 		sg_init_table(&dbi->sgl, 1);
 		sg_dma_address(&dbi->sgl) = dbi->dma_addr;
+		dma->buf_count = buf_count;
+		dma->cyclic = cyclic;
 	} else {
 		dma->buf_size = buf_size;
 		/* Round up the allocations */
@@ -1112,6 +1158,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 		config.dst_maxburst = dma_caps.max_burst;
 	else
 		config.src_maxburst = dma_caps.max_burst;
+	dma->burst_bytes = dma_caps.max_burst * sizeof(uint32_t);
 
 	ret = dmaengine_slave_config(dma->chan, &config);
 	if (ret)
@@ -1140,6 +1187,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 					       DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 		if (!desc) {
 			dev_err(dev, "DMA preparation failed\n");
+			ret = -EIO;
 			goto err_dma_free;
 		}
 
@@ -1151,13 +1199,12 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 		if (ret < 0)
 			goto err_dma_free;
 
-		dma->cyclic = cyclic;
 		dma_async_issue_pending(dma->chan);
 	}
 	return 0;
 
 err_dma_free:
-	rp1_pio_sm_dma_free(dev, dma);
+	rp1_pio_sm_dma_free(dma);
 
 err_unclaim:
 	spin_lock(&pio->lock);
@@ -1195,10 +1242,24 @@ static int rp1_pio_sm_config_xfer_v2_user(struct rp1_pio_client *client, void *p
 					       args->flags);
 }
 
+/*
+ * Record the progress of a transfer in its arguments. If the call is
+ * interrupted, the updated arguments are copied back to the caller, so that
+ * a restarted call resumes where this one stopped rather than repeating it.
+ */
+static void rp1_pio_sm_xfer_progress(struct rp1_pio_sm_xfer_data32_args *args,
+				     size_t bytes)
+{
+	args->data += bytes;
+	args->data_bytes -= bytes;
+}
+
 static int rp1_pio_sm_tx_user(struct rp1_pio_device *pio, struct dma_info *dma,
-				  const void __user *userbuf, size_t bytes)
+			      struct rp1_pio_sm_xfer_data32_args *args)
 {
 	struct platform_device *pdev = pio->pdev;
+	const void __user *userbuf = args->data;
+	size_t bytes = args->data_bytes;
 	struct dma_async_tx_descriptor *desc;
 	struct device *dev = &pdev->dev;
 	int ret = 0;
@@ -1209,10 +1270,8 @@ static int rp1_pio_sm_tx_user(struct rp1_pio_device *pio, struct dma_info *dma,
 
 		/* grab the next free buffer, waiting if they're all full */
 		if (dma->head_idx - dma->tail_idx == dma->buf_count) {
-			if (down_interruptible(&dma->buf_sem)) {
-				dev_err(dev, "DMA bounce interrupted\n");
-				break;
-			}
+			if (down_interruptible(&dma->buf_sem))
+				return -ERESTARTSYS;
 			dma->tail_idx++;
 		}
 
@@ -1220,9 +1279,8 @@ static int rp1_pio_sm_tx_user(struct rp1_pio_device *pio, struct dma_info *dma,
 
 		sg_dma_len(&dbi->sgl) = copy_bytes;
 
-		ret = copy_from_user(dbi->buf, userbuf, copy_bytes);
-		if (ret < 0)
-			break;
+		if (copy_from_user(dbi->buf, userbuf, copy_bytes))
+			return -EFAULT;
 
 		userbuf += copy_bytes;
 
@@ -1249,6 +1307,7 @@ static int rp1_pio_sm_tx_user(struct rp1_pio_device *pio, struct dma_info *dma,
 
 		dma->head_idx++;
 		bytes -= copy_bytes;
+		rp1_pio_sm_xfer_progress(args, copy_bytes);
 	}
 
 	return ret;
@@ -1297,9 +1356,10 @@ static int rp1_pio_sm_rx_submit(struct rp1_pio_device *pio, struct dma_info *dma
  * chunk (reads can be any size up to buf_size, and need not match it).
  */
 static int rp1_pio_sm_rx_user(struct rp1_pio_device *pio, struct dma_info *dma,
-				  void __user *userbuf, size_t bytes)
+			      struct rp1_pio_sm_xfer_data32_args *args)
 {
-	struct device *dev = &pio->pdev->dev;
+	void __user *userbuf = args->data;
+	size_t bytes = args->data_bytes;
 	int ret;
 
 	if (!bytes)
@@ -1358,16 +1418,16 @@ static int rp1_pio_sm_rx_user(struct rp1_pio_device *pio, struct dma_info *dma,
 		if (len > bytes)
 			return -EINVAL;
 
-		if (down_interruptible(&dma->buf_sem)) {
-			dev_err(dev, "DMA wait interrupted\n");
-			return -ETIMEDOUT;
-		}
+		if (down_interruptible(&dma->buf_sem))
+			return -ERESTARTSYS;
+
 		dma->tail_idx++;
 
 		if (copy_to_user(userbuf, dbi->buf, len))
 			return -EFAULT;
 		userbuf += len;
 		bytes -= len;
+		rp1_pio_sm_xfer_progress(args, len);
 	}
 
 	return 0;
@@ -1394,22 +1454,28 @@ static int rp1_pio_sm_xfer_data32_user(struct rp1_pio_client *client, void *para
 		return -EINVAL;
 
 	if (args->dir == RP1_PIO_DIR_TO_SM)
-		return rp1_pio_sm_tx_user(pio, dma, args->data, args->data_bytes);
+		return rp1_pio_sm_tx_user(pio, dma, args);
 	else
-		return rp1_pio_sm_rx_user(pio, dma, args->data, args->data_bytes);
+		return rp1_pio_sm_rx_user(pio, dma, args);
 }
 
 static int rp1_pio_sm_xfer_data_user(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_xfer_data_args *args = param;
 	struct rp1_pio_sm_xfer_data32_args args32;
+	int ret;
 
 	args32.sm = args->sm;
 	args32.dir = args->dir;
 	args32.data_bytes = args->data_bytes;
 	args32.data = args->data;
 
-	return rp1_pio_sm_xfer_data32_user(client, &args32);
+	ret = rp1_pio_sm_xfer_data32_user(client, &args32);
+
+	args->data_bytes = args32.data_bytes;
+	args->data = args32.data;
+
+	return ret;
 }
 
 int rp1_pio_sm_config_xfer(struct rp1_pio_client *client, uint sm, uint dir,
@@ -1509,10 +1575,11 @@ struct handler_info {
 	const char *name;
 	int (*func)(struct rp1_pio_client *client, void *param);
 	int argsize;
+	bool restartable;
 } ioctl_handlers[] = {
 	HANDLER(SM_CONFIG_XFER, sm_config_xfer_user),
-	HANDLER(SM_XFER_DATA, sm_xfer_data_user),
-	HANDLER(SM_XFER_DATA32, sm_xfer_data32_user),
+	HANDLER_RESTARTABLE(SM_XFER_DATA, sm_xfer_data_user),
+	HANDLER_RESTARTABLE(SM_XFER_DATA32, sm_xfer_data32_user),
 	HANDLER(SM_CONFIG_XFER32, sm_config_xfer32_user),
 	HANDLER(SM_CONFIG_XFER_V2, sm_config_xfer_v2_user),
 
@@ -1647,7 +1714,10 @@ void rp1_pio_close(struct rp1_pio_client *client)
 			struct dma_info *dma = &pio->dma_configs[i >> 1][i & 1];
 
 			claimed &= ~mask;
-			rp1_pio_sm_dma_free(&pio->pdev->dev, dma);
+			/* The SMs have been disabled, so this is safe */
+			if ((i & 1) == RP1_PIO_DIR_FROM_SM)
+				rp1_pio_sm_dma_flush_rx(dma);
+			rp1_pio_sm_dma_free(dma);
 		}
 	}
 
@@ -1735,6 +1805,10 @@ static long rp1_pio_ioctl(struct file *filp, unsigned int ioctl_num,
 	if (ret > 0) {
 		if (copy_to_user(argp, argbuf, ret))
 			ret = -EFAULT;
+	} else if (ret == -ERESTARTSYS && hdlr->restartable) {
+		/* Pass back the progress, so that a restart resumes from there */
+		if (copy_to_user(argp, argbuf, sz))
+			ret = -EFAULT;
 	}
 
 	return ret;
@@ -1779,6 +1853,7 @@ static long rp1_pio_compat_ioctl(struct file *filp, unsigned int ioctl_num,
 	{
 		struct rp1_pio_sm_xfer_data_args_compat compat_param;
 		struct rp1_pio_sm_xfer_data_args param;
+		int ret;
 
 		if (copy_from_user(&compat_param, compat_ptr(ioctl_param), sizeof(compat_param)))
 			return -EFAULT;
@@ -1786,12 +1861,21 @@ static long rp1_pio_compat_ioctl(struct file *filp, unsigned int ioctl_num,
 		param.dir = compat_param.dir;
 		param.data_bytes = compat_param.data_bytes;
 		param.data = compat_ptr(compat_param.data);
-		return rp1_pio_sm_xfer_data_user(client, &param);
+		ret = rp1_pio_sm_xfer_data_user(client, &param);
+		if (ret == -ERESTARTSYS) {
+			compat_param.data_bytes = param.data_bytes;
+			compat_param.data = ptr_to_compat(param.data);
+			if (copy_to_user(compat_ptr(ioctl_param), &compat_param,
+					 sizeof(compat_param)))
+				ret = -EFAULT;
+		}
+		return ret;
 	}
 	case PIO_IOC_SM_XFER_DATA32_COMPAT:
 	{
 		struct rp1_pio_sm_xfer_data32_args_compat compat_param;
 		struct rp1_pio_sm_xfer_data32_args param;
+		int ret;
 
 		if (copy_from_user(&compat_param, compat_ptr(ioctl_param), sizeof(compat_param)))
 			return -EFAULT;
@@ -1799,7 +1883,15 @@ static long rp1_pio_compat_ioctl(struct file *filp, unsigned int ioctl_num,
 		param.dir = compat_param.dir;
 		param.data_bytes = compat_param.data_bytes;
 		param.data = compat_ptr(compat_param.data);
-		return rp1_pio_sm_xfer_data32_user(client, &param);
+		ret = rp1_pio_sm_xfer_data32_user(client, &param);
+		if (ret == -ERESTARTSYS) {
+			compat_param.data_bytes = param.data_bytes;
+			compat_param.data = ptr_to_compat(param.data);
+			if (copy_to_user(compat_ptr(ioctl_param), &compat_param,
+					 sizeof(compat_param)))
+				ret = -EFAULT;
+		}
+		return ret;
 	}
 
 	case PIO_IOC_READ_HW_COMPAT:

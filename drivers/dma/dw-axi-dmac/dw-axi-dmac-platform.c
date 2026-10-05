@@ -230,6 +230,32 @@ static inline void axi_chan_disable(struct axi_dma_chan *chan)
 	}
 }
 
+/*
+ * Abort a channel, flushing its FIFO. This is only intended for use when a
+ * channel has failed to respond to a disable request, e.g. because it is
+ * stalled waiting on a peripheral handshake.
+ */
+static inline void axi_chan_abort(struct axi_dma_chan *chan)
+{
+	u64 val;
+
+	if (chan->chip->dw->hdata->reg_map_8_channels) {
+		val = BIT(chan->id) << (DMAC_CHAN_ABORT_SHIFT - 32) |
+		      BIT(chan->id) << (DMAC_CHAN_ABORT_WE_SHIFT - 32);
+		axi_dma_iowrite32(chan->chip, DMAC_CHEN + 4, (u32)val);
+	} else if (chan->id >= DMAC_CHAN_16) {
+		val = (u64)(BIT(chan->id) >> DMAC_CHAN_16)
+			<< (DMAC_CHAN_ABORT2_SHIFT + DMAC_CHAN_BLOCK_SHIFT) |
+		      (u64)(BIT(chan->id) >> DMAC_CHAN_16)
+			<< (DMAC_CHAN_ABORT2_WE_SHIFT + DMAC_CHAN_BLOCK_SHIFT);
+		axi_dma_iowrite64(chan->chip, DMAC_CHABORTREG, val);
+	} else {
+		val = BIT(chan->id) << DMAC_CHAN_ABORT2_SHIFT |
+		      BIT(chan->id) << DMAC_CHAN_ABORT2_WE_SHIFT;
+		axi_dma_iowrite32(chan->chip, DMAC_CHABORTREG, (u32)val);
+	}
+}
+
 static inline void axi_chan_enable(struct axi_dma_chan *chan)
 {
 	u64 val;
@@ -606,10 +632,15 @@ static int dma_chan_alloc_chan_resources(struct dma_chan *dchan)
 	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
 	int ret;
 
+	ret = pm_runtime_resume_and_get(chan->chip->dev);
+	if (ret < 0)
+		return ret;
+
 	/* ASSERT: channel is idle */
 	if (axi_chan_is_hw_enable(chan)) {
 		dev_err(chan2dev(chan), "%s is non-idle!\n",
 			axi_chan_name(chan));
+		pm_runtime_put(chan->chip->dev);
 		return -EBUSY;
 	}
 
@@ -620,21 +651,10 @@ static int dma_chan_alloc_chan_resources(struct dma_chan *dchan)
 					  64, 0);
 	if (!chan->desc_pool) {
 		dev_err(chan2dev(chan), "No memory for descriptors\n");
+		pm_runtime_put(chan->chip->dev);
 		return -ENOMEM;
 	}
 	dev_vdbg(dchan2dev(dchan), "%s: allocating\n", axi_chan_name(chan));
-
-	/*
-	 * Callers configure and use the channel's registers as soon as this
-	 * returns, so the chip's clocks must already be running - a plain
-	 * pm_runtime_get() only schedules the resume asynchronously.
-	 */
-	ret = pm_runtime_resume_and_get(chan->chip->dev);
-	if (ret < 0) {
-		dma_pool_destroy(chan->desc_pool);
-		chan->desc_pool = NULL;
-		return ret;
-	}
 
 	return 0;
 }
@@ -1362,9 +1382,21 @@ static int dma_chan_terminate_all(struct dma_chan *dchan)
 
 	ret = readl_poll_timeout_atomic(chan->chip->regs + DMAC_CHEN, val,
 					!(val & chan_active), 1000, 50000);
-	if (ret == -ETIMEDOUT)
-		dev_warn(dchan2dev(dchan),
-			 "%s failed to stop\n", axi_chan_name(chan));
+	if (ret == -ETIMEDOUT) {
+		/*
+		 * The channel is probably stalled waiting for a handshake
+		 * from the peripheral - abort it. Discarding the contents
+		 * of the FIFO is permitted when terminating, so this is
+		 * not an error.
+		 */
+		dev_dbg(dchan2dev(dchan), "%s aborting\n", axi_chan_name(chan));
+		axi_chan_abort(chan);
+		ret = readl_poll_timeout_atomic(chan->chip->regs + DMAC_CHEN, val,
+						!(val & chan_active), 10, 10000);
+		if (ret == -ETIMEDOUT)
+			dev_err(dchan2dev(dchan),
+				"%s failed to abort\n", axi_chan_name(chan));
+	}
 
 	if (chan->direction != DMA_MEM_TO_MEM)
 		dw_axi_dma_set_hw_channel(chan, false);
@@ -1924,6 +1956,8 @@ static void dw_remove(struct platform_device *pdev)
 }
 
 static const struct dev_pm_ops dw_axi_dma_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+				pm_runtime_force_resume)
 	SET_RUNTIME_PM_OPS(axi_dma_runtime_suspend, axi_dma_runtime_resume, NULL)
 };
 
