@@ -41,7 +41,17 @@
 #define DRIVER_NAME		"rp1-pio"
 
 #define RP1_PIO_SMS_COUNT	4
+#define RP1_PIO_SM_MASK		((1 << RP1_PIO_SMS_COUNT) - 1)
 #define RP1_PIO_INSTR_COUNT	32
+#define RP1_PIO_INTERRUPT_COUNT	8
+#define RP1_GPIO_FUNC_MAX	0x1f
+
+/*
+ * The longest that the firmware is asked to wait for SM flags in a single
+ * message. The firmware waits by polling, with the mailbox blocked, so
+ * longer timeouts are broken up into multiple messages.
+ */
+#define RP1_PIO_FLAGS_WAIT_MAX_US	1000
 
 #define MAX_ARG_SIZE		256
 
@@ -102,6 +112,12 @@ struct dma_buf_info {
 };
 
 struct dma_info {
+	/*
+	 * Serialises the configuration and use of the channel by user space,
+	 * so that the channel and its buffers can't be freed or replaced
+	 * during a transfer.
+	 */
+	struct mutex lock;
 	struct semaphore buf_sem;
 	wait_queue_head_t cyclic_wait;
 	struct dma_chan *chan;
@@ -221,6 +237,10 @@ static int rp1_pio_read_hw(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_device *pio = client->pio;
 	struct rp1_access_hw_args *args = param;
 
+	/* Don't let the address range wrap */
+	if (args->addr + args->len < args->addr)
+		return -EINVAL;
+
 	return rp1_pio_message_resp(pio, READ_HW,
 				    args, 8, NULL, args->data, args->len);
 }
@@ -232,7 +252,13 @@ static int rp1_pio_write_hw(struct rp1_pio_client *client, void *param)
 	uint32_t write_buf[32 + 1];
 	int len;
 
+	if (pio->fw_pio_count <= WRITE_HW)
+		return -EOPNOTSUPP;
+
 	len = min(args->len, sizeof(write_buf) - 4);
+	/* Don't let the address range wrap */
+	if (args->addr + len < args->addr)
+		return -EINVAL;
 	write_buf[0] = args->addr;
 	if (copy_from_user(&write_buf[1], args->data, len))
 		return -EFAULT;
@@ -272,7 +298,7 @@ int rp1_pio_can_add_program(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_device *pio = client->pio;
 	int offset;
 
-	if (args->num_instrs > RP1_PIO_INSTR_COUNT ||
+	if (!args->num_instrs || args->num_instrs > RP1_PIO_INSTR_COUNT ||
 		((args->origin != RP1_PIO_ORIGIN_ANY) &&
 		 (args->origin >= RP1_PIO_INSTR_COUNT ||
 		  ((args->origin + args->num_instrs) > RP1_PIO_INSTR_COUNT))))
@@ -297,7 +323,7 @@ int rp1_pio_add_program(struct rp1_pio_client *client, void *param)
 	int offset;
 	uint i;
 
-	if (args->num_instrs > RP1_PIO_INSTR_COUNT ||
+	if (!args->num_instrs || args->num_instrs > RP1_PIO_INSTR_COUNT ||
 		((args->origin != RP1_PIO_ORIGIN_ANY) &&
 		 (args->origin >= RP1_PIO_INSTR_COUNT ||
 		  ((args->origin + args->num_instrs) > RP1_PIO_INSTR_COUNT))))
@@ -305,8 +331,20 @@ int rp1_pio_add_program(struct rp1_pio_client *client, void *param)
 
 	mutex_lock(&pio->instr_mutex);
 	offset = rp1_pio_find_program(pio, args);
-	if (offset < 0)
+	if (offset >= 0) {
+		/* Sharing an existing copy - make sure it can take another user */
+		for (i = 0; i < args->num_instrs; i++) {
+			if (pio->instr_refcounts[offset + i] == U8_MAX) {
+				offset = -EBUSY;
+				break;
+			}
+		}
+	} else {
 		offset = rp1_pio_message(client->pio, PIO_ADD_PROGRAM, args, sizeof(*args));
+		/* Don't trust the firmware to return a usable offset */
+		if (offset >= 0 && offset + args->num_instrs > RP1_PIO_INSTR_COUNT)
+			offset = -EIO;
+	}
 
 	if (offset >= 0) {
 		uint32_t used_mask;
@@ -356,7 +394,7 @@ int rp1_pio_remove_program(struct rp1_pio_client *client, void *param)
 	uint32_t used_mask;
 	int ret = -ENODEV;
 
-	if (args->num_instrs > RP1_PIO_INSTR_COUNT ||
+	if (!args->num_instrs || args->num_instrs > RP1_PIO_INSTR_COUNT ||
 		args->origin >= RP1_PIO_INSTR_COUNT ||
 		(args->origin + args->num_instrs) > RP1_PIO_INSTR_COUNT)
 		return -EINVAL;
@@ -391,12 +429,15 @@ int rp1_pio_sm_claim(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_device *pio = client->pio;
 	int ret;
 
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
+
 	mutex_lock(&pio->instr_mutex);
 	ret = rp1_pio_message(client->pio, PIO_SM_CLAIM, args, sizeof(*args));
 	if (ret >= 0) {
 		if (args->mask)
 			client->claimed_sms |= args->mask;
-		else
+		else if (ret < RP1_PIO_SMS_COUNT)
 			client->claimed_sms |= (1 << ret);
 		pio->claimed_sms |= client->claimed_sms;
 	}
@@ -409,6 +450,9 @@ int rp1_pio_sm_unclaim(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_claim_args *args = param;
 	struct rp1_pio_device *pio = client->pio;
+
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
 
 	mutex_lock(&pio->instr_mutex);
 	(void)rp1_pio_message(client->pio, PIO_SM_UNCLAIM, args, sizeof(*args));
@@ -423,6 +467,9 @@ int rp1_pio_sm_is_claimed(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_claim_args *args = param;
 
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_IS_CLAIMED, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_is_claimed);
@@ -431,6 +478,10 @@ int rp1_pio_sm_init(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_init_args *args = param;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT ||
+	    args->initial_pc >= RP1_PIO_INSTR_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_INIT, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_init);
@@ -438,6 +489,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_init);
 int rp1_pio_sm_set_config(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_config_args *args = param;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_SM_SET_CONFIG, args, sizeof(*args));
 }
@@ -448,6 +502,9 @@ int rp1_pio_sm_exec(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_sm_exec_args *args = param;
 	unsigned long interval = POLL_INTERVAL_MIN;
 	int ret;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	if (args->blocking)
 		args->blocking = 2;
@@ -470,6 +527,9 @@ int rp1_pio_sm_clear_fifos(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_clear_fifos_args *args = param;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_CLEAR_FIFOS, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_clear_fifos);
@@ -477,6 +537,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_clear_fifos);
 int rp1_pio_sm_set_clkdiv(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_clkdiv_args *args = param;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_SM_SET_CLKDIV, args, sizeof(*args));
 }
@@ -486,6 +549,9 @@ int rp1_pio_sm_set_pins(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_pins_args *args = param;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_SET_PINS, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_set_pins);
@@ -493,6 +559,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_set_pins);
 int rp1_pio_sm_set_pindirs(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_pindirs_args *args = param;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_SM_SET_PINDIRS, args, sizeof(*args));
 }
@@ -502,6 +571,9 @@ int rp1_pio_sm_set_enabled(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_enabled_args *args = param;
 
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_SET_ENABLED, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_set_enabled);
@@ -509,6 +581,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_set_enabled);
 int rp1_pio_sm_restart(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_restart_args *args = param;
+
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_SM_RESTART, args, sizeof(*args));
 }
@@ -518,6 +593,9 @@ int rp1_pio_sm_clkdiv_restart(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_restart_args *args = param;
 
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_CLKDIV_RESTART, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_clkdiv_restart);
@@ -525,6 +603,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_clkdiv_restart);
 int rp1_pio_sm_enable_sync(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_enable_sync_args *args = param;
+
+	if (args->mask & ~RP1_PIO_SM_MASK)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_SM_ENABLE_SYNC, args, sizeof(*args));
 }
@@ -535,6 +616,9 @@ int rp1_pio_sm_put(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_sm_put_args *args = param;
 	unsigned long interval = POLL_INTERVAL_MIN;
 	int ret;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	if (args->blocking)
 		args->blocking = 2;
@@ -558,6 +642,9 @@ int rp1_pio_sm_get(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_sm_get_args *args = param;
 	unsigned long interval = POLL_INTERVAL_MIN;
 	int ret;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	if (args->blocking)
 		args->blocking = 2;
@@ -583,6 +670,9 @@ int rp1_pio_sm_set_dmactrl(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_set_dmactrl_args *args = param;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_SET_DMACTRL, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_set_dmactrl);
@@ -592,6 +682,9 @@ int rp1_pio_sm_get_dmactrl(struct rp1_pio_client *client, void *param)
 	struct rp1_pio_device *pio = client->pio;
 	struct rp1_pio_sm_get_dmactrl_args *args = param;
 	int ret;
+
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
 
 	if (pio->fw_pio_count >= PIO_SM_GET_DMACTRL) {
 		ret = rp1_pio_message_resp(pio, PIO_SM_GET_DMACTRL, args, sizeof(*args),
@@ -617,6 +710,9 @@ int rp1_pio_sm_fifo_state(struct rp1_pio_client *client, void *param)
 	const int level_offset = offsetof(struct rp1_pio_sm_fifo_state_args, level);
 	int ret;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
 	ret = rp1_pio_message_resp(client->pio, PIO_SM_FIFO_STATE, args, sizeof(*args),
 				   &args->level, NULL, sizeof(*args) - level_offset);
 	if (ret >= 0)
@@ -629,6 +725,9 @@ int rp1_pio_sm_drain_tx(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_clear_fifos_args *args = param;
 
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SM_DRAIN_TX, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_sm_drain_tx);
@@ -636,12 +735,40 @@ EXPORT_SYMBOL_GPL(rp1_pio_sm_drain_tx);
 int rp1_pio_sm_get_flags(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_sm_get_flags_args *args = param;
+	unsigned long interval = POLL_INTERVAL_MIN;
+	uint32_t timeout = args->timeout;
+	uint32_t flags = args->flags;
+	ktime_t end;
 	int ret;
 
-	ret = rp1_pio_message_resp(client->pio, PIO_SM_GET_FLAGS, args, sizeof(*args),
-				   &args->flags, NULL, sizeof(args->flags));
-	if (ret >= 0)
-		return offsetof(struct rp1_pio_sm_get_flags_args, flags) + ret;
+	if (args->sm >= RP1_PIO_SMS_COUNT)
+		return -EINVAL;
+
+	/*
+	 * The firmware waits for the flags by polling with the mailbox
+	 * blocked, so only let it wait for a short time. Do the rest of the
+	 * waiting here, where it can sleep and be interrupted.
+	 */
+	end = ktime_add_us(ktime_get(), timeout);
+
+	while (1) {
+		s64 remaining = ktime_us_delta(end, ktime_get());
+
+		args->flags = flags;
+		args->timeout = clamp_t(s64, remaining, 0,
+					min_t(uint32_t, timeout, RP1_PIO_FLAGS_WAIT_MAX_US));
+		ret = rp1_pio_message_resp(client->pio, PIO_SM_GET_FLAGS, args, sizeof(*args),
+					   &args->flags, NULL, sizeof(args->flags));
+		if (ret < 0)
+			break;
+		if (args->flags || remaining <= RP1_PIO_FLAGS_WAIT_MAX_US)
+			return offsetof(struct rp1_pio_sm_get_flags_args, flags) + ret;
+		if (signal_pending(current))
+			return -ERESTARTSYS;
+		fsleep(min_t(s64, interval, remaining));
+		POLL_INTERVAL_NEXT(interval);
+	}
+
 	args->flags = ~0;
 	return ret;
 }
@@ -651,6 +778,9 @@ int rp1_pio_gpio_init(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_init_args *args = param;
 
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, GPIO_INIT, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_gpio_init);
@@ -658,6 +788,10 @@ EXPORT_SYMBOL_GPL(rp1_pio_gpio_init);
 int rp1_pio_gpio_set_function(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_function_args *args = param;
+
+	if (args->gpio >= RP1_PIO_GPIO_COUNT ||
+	    args->fn > RP1_GPIO_FUNC_MAX)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, GPIO_SET_FUNCTION, args, sizeof(*args));
 }
@@ -667,6 +801,9 @@ int rp1_pio_gpio_set_pulls(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_pulls_args *args = param;
 
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, GPIO_SET_PULLS, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_pulls);
@@ -674,6 +811,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_pulls);
 int rp1_pio_gpio_set_outover(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_args *args = param;
+
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, GPIO_SET_OUTOVER, args, sizeof(*args));
 }
@@ -683,6 +823,9 @@ int rp1_pio_gpio_set_inover(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_args *args = param;
 
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, GPIO_SET_INOVER, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_inover);
@@ -690,6 +833,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_inover);
 int rp1_pio_gpio_set_oeover(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_args *args = param;
+
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, GPIO_SET_OEOVER, args, sizeof(*args));
 }
@@ -699,6 +845,9 @@ int rp1_pio_gpio_set_input_enabled(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_args *args = param;
 
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, GPIO_SET_INPUT_ENABLED, args, sizeof(*args));
 }
 EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_input_enabled);
@@ -706,6 +855,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_gpio_set_input_enabled);
 int rp1_pio_gpio_set_drive_strength(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_gpio_set_args *args = param;
+
+	if (args->gpio >= RP1_PIO_GPIO_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, GPIO_SET_DRIVE_STRENGTH, args, sizeof(*args));
 }
@@ -784,6 +936,9 @@ int rp1_pio_set_irqn_source_mask_enabled(struct rp1_pio_client *client, void *pa
 {
 	struct rp1_pio_set_irqn_source_mask_enabled_args *args = param;
 
+	if (args->irq_index >= RP1_PIO_IRQ_COUNT)
+		return -EINVAL;
+
 	return rp1_pio_message(client->pio, PIO_SET_IRQN_SOURCE_MASK_ENABLED,
 			       args, sizeof(*args));
 }
@@ -793,6 +948,9 @@ int rp1_pio_interrupt_get(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_interrupt_get_args *args = param;
 	int ret;
+
+	if (args->pio_interrupt_num >= RP1_PIO_INTERRUPT_COUNT)
+		return -EINVAL;
 
 	ret = rp1_pio_message_resp(client->pio, PIO_INTERRUPT_GET, args, sizeof(*args),
 				   &args->active, NULL, sizeof(args->active));
@@ -805,6 +963,9 @@ EXPORT_SYMBOL_GPL(rp1_pio_interrupt_get);
 int rp1_pio_interrupt_clear(struct rp1_pio_client *client, void *param)
 {
 	struct rp1_pio_interrupt_clear_args *args = param;
+
+	if (args->pio_interrupt_num >= RP1_PIO_INTERRUPT_COUNT)
+		return -EINVAL;
 
 	return rp1_pio_message(client->pio, PIO_INTERRUPT_CLEAR, args, sizeof(*args));
 }
@@ -822,10 +983,12 @@ int rp1_pio_irq_set_enabled(struct rp1_pio_client *client, void *param)
 	if (irq_index >= pio->irq_count)
 		return -EINVAL;
 	irqi = &pio->irqs[irq_index];
-	if (irqi->owner != client)
-		return -EBUSY;
 
 	spin_lock(&pio->lock);
+	if (irqi->owner != client) {
+		spin_unlock(&pio->lock);
+		return -EBUSY;
+	}
 	if (args->enabled && !irqi->enabled) {
 		enable_irq(irqi->irq);
 		irqi->enabled = true;
@@ -851,12 +1014,17 @@ int rp1_pio_irq_is_enabled(struct rp1_pio_client *client, void *param)
 	if (irq_index >= pio->irq_count)
 		return -EINVAL;
 	irqi = &pio->irqs[irq_index];
-	if (irqi->owner != client)
+
+	spin_lock(&pio->lock);
+	if (irqi->owner != client) {
+		spin_unlock(&pio->lock);
 		return -EBUSY;
-
+	}
 	args->enabled = irqi->enabled;
+	spin_unlock(&pio->lock);
 
-	return 0;
+	/* Return the size of the arguments, so that the result is copied back */
+	return sizeof(*args);
 }
 EXPORT_SYMBOL_GPL(rp1_pio_irq_is_enabled);
 
@@ -1103,7 +1271,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 	bool tx = dir == RP1_PIO_DIR_TO_SM;
 	bool prefer_light_dma = flags & BIT(0);
 	bool force_dma_type = flags & BIT(1);
-	bool reconfigure = false;
+	struct dma_chan *chan;
 	phys_addr_t fifo_addr;
 	uint32_t dma_mask;
 	char chan_name[5];
@@ -1141,30 +1309,38 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 
 	dma_mask = 1 << (sm * 2 + dir);
 
+	/* Fail quickly, rather than wait for another client's transfer */
 	spin_lock(&pio->lock);
-	if (!(pio->claimed_dmas & dma_mask & ~client->claimed_dmas)) {
+	if (!(pio->claimed_dmas & dma_mask & ~client->claimed_dmas))
 		dma = &pio->dma_configs[sm][dir];
-		if (client->claimed_dmas & dma_mask)
-			reconfigure = true;
-		pio->claimed_dmas |= dma_mask;
-		client->claimed_dmas |= dma_mask;
-	}
 	spin_unlock(&pio->lock);
 	if (!dma)
 		return -EBUSY;
 
+	/*
+	 * Wait for any transfer or configuration by this client to finish,
+	 * then claim the channel for real.
+	 */
+	if (mutex_lock_interruptible(&dma->lock))
+		return -ERESTARTSYS;
+
+	spin_lock(&pio->lock);
+	if (pio->claimed_dmas & dma_mask & ~client->claimed_dmas) {
+		ret = -EBUSY;
+	} else {
+		pio->claimed_dmas |= dma_mask;
+		client->claimed_dmas |= dma_mask;
+	}
+	spin_unlock(&pio->lock);
+	if (ret)
+		goto out_unlock;
+
 	/* dma_release_channel() sleeps, so free the old channel outside the lock. */
-	if (reconfigure)
+	if (dma->chan)
 		rp1_pio_sm_dma_free(dma);
 
 	/* Note: the semaphore is only used by non-cyclic DMA */
 	sema_init(&dma->buf_sem, 0);
-
-	if (!reconfigure) {
-		/* the waitqueue and spinlock are only used by cyclic DMA */
-		init_waitqueue_head(&dma->cyclic_wait);
-		spin_lock_init(&dma->cyclic_lock);
-	}
 
 	/* Allocate and configure a DMA channel */
 	/* Careful - each SM FIFO has its own DREQ value */
@@ -1183,11 +1359,15 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 	dma->cyclic_underflow = false;
 	dma->cyclic_tx_issued = false;
 	dma->tx = tx;
-	dma->chan = dma_request_chan(dev, chan_name);
-	if (IS_ERR(dma->chan)) {
-		ret = PTR_ERR(dma->chan);
+	dma->buf_size = 0;
+	dma->buf_count = 0;
+	/* dma->chan is only ever NULL or a valid channel */
+	chan = dma_request_chan(dev, chan_name);
+	if (IS_ERR(chan)) {
+		ret = PTR_ERR(chan);
 		goto err_unclaim;
 	}
+	dma->chan = chan;
 	dma_get_slave_caps(dma->chan, &dma_caps);
 	if (force_dma_type &&
 	    dma_caps.max_burst != (prefer_light_dma ? 4 : 8)) {
@@ -1300,7 +1480,7 @@ static int rp1_pio_sm_config_xfer_internal(struct rp1_pio_client *client, uint s
 		if (!tx)
 			dma_async_issue_pending(dma->chan);
 	}
-	return 0;
+	goto out_unlock;
 
 err_dma_free:
 	rp1_pio_sm_dma_free(dma);
@@ -1310,6 +1490,9 @@ err_unclaim:
 	client->claimed_dmas &= ~dma_mask;
 	pio->claimed_dmas &= ~dma_mask;
 	spin_unlock(&pio->lock);
+
+out_unlock:
+	mutex_unlock(&dma->lock);
 
 	return ret;
 }
@@ -1650,8 +1833,10 @@ static int rp1_pio_sm_xfer_data32_user(struct rp1_pio_client *client, void *para
 {
 	struct rp1_pio_sm_xfer_data32_args *args = param;
 	struct rp1_pio_device *pio = client->pio;
-	struct dma_info *dma = NULL;
+	struct dma_info *dma;
 	uint32_t dma_mask;
+	bool claimed;
+	int ret;
 
 	if (args->sm >= RP1_PIO_SMS_COUNT || args->dir >= RP1_PIO_DIR_COUNT ||
 	    !args->data_bytes ||
@@ -1659,19 +1844,32 @@ static int rp1_pio_sm_xfer_data32_user(struct rp1_pio_client *client, void *para
 		return -EINVAL;
 
 	dma_mask = 1 << (args->sm * 2 + args->dir);
-	spin_lock(&pio->lock);
-	if (client->claimed_dmas & dma_mask)
-		dma = &pio->dma_configs[args->sm][args->dir];
-	spin_unlock(&pio->lock);
-	if (!dma)
-		return -EINVAL;
+	dma = &pio->dma_configs[args->sm][args->dir];
 
-	if (args->dir == RP1_PIO_DIR_TO_SM)
-		return dma->cyclic ? rp1_pio_sm_tx_user_cyclic(pio, dma, args) :
-				     rp1_pio_sm_tx_user(pio, dma, args);
+	/*
+	 * Hold the lock for the whole transfer, even though it may block,
+	 * so that the channel can't be reconfigured underneath it.
+	 */
+	if (mutex_lock_interruptible(&dma->lock))
+		return -ERESTARTSYS;
+
+	spin_lock(&pio->lock);
+	claimed = client->claimed_dmas & dma_mask;
+	spin_unlock(&pio->lock);
+
+	/* A channel configured with no buffers is of no use to user space */
+	if (!claimed || !dma->chan || !dma->buf_count)
+		ret = -EINVAL;
+	else if (args->dir == RP1_PIO_DIR_TO_SM)
+		ret = dma->cyclic ? rp1_pio_sm_tx_user_cyclic(pio, dma, args) :
+				    rp1_pio_sm_tx_user(pio, dma, args);
 	else
-		return dma->cyclic ? rp1_pio_sm_rx_user_cyclic(pio, dma, args) :
-				     rp1_pio_sm_rx_user(pio, dma, args);
+		ret = dma->cyclic ? rp1_pio_sm_rx_user_cyclic(pio, dma, args) :
+				    rp1_pio_sm_rx_user(pio, dma, args);
+
+	mutex_unlock(&dma->lock);
+
+	return ret;
 }
 
 static int rp1_pio_sm_xfer_data_user(struct rp1_pio_client *client, void *param)
@@ -1888,26 +2086,39 @@ void rp1_pio_close(struct rp1_pio_client *client)
 
 	/* Free any allocated resources */
 
-	spin_lock(&pio->lock);
 	for (i = 0; i < pio->irq_count; i++) {
-		irqi = &pio->irqs[i];
-		if (irqi->owner == client) {
-			/*
-			 * Disable directly rather than via irq_set_enabled():
-			 * that helper takes pio->lock itself, and it is
-			 * already held here.
-			 */
-			if (irqi->enabled) {
-				disable_irq(irqi->irq);
-				irqi->enabled = false;
-			}
+		bool enabled;
 
-			irqi->owner = NULL;
-			irqi->handler = NULL;
-			irqi->context = NULL;
+		irqi = &pio->irqs[i];
+
+		spin_lock(&pio->lock);
+		if (irqi->owner != client) {
+			spin_unlock(&pio->lock);
+			continue;
 		}
+		enabled = irqi->enabled;
+		irqi->enabled = false;
+		spin_unlock(&pio->lock);
+
+		/*
+		 * The handler uses the client, so make sure it isn't running
+		 * and can't run again before giving up the interrupt. If the
+		 * interrupt was disabled with disable_irq_nosync() then the
+		 * handler may still be running. Both of these can sleep, so
+		 * call them without the lock - nobody else can claim the
+		 * interrupt while it still has an owner.
+		 */
+		if (enabled)
+			disable_irq(irqi->irq);
+		else
+			synchronize_irq(irqi->irq);
+
+		spin_lock(&pio->lock);
+		irqi->owner = NULL;
+		irqi->handler = NULL;
+		irqi->context = NULL;
+		spin_unlock(&pio->lock);
 	}
-	spin_unlock(&pio->lock);
 
 	if (client->claimed_sms) {
 		struct rp1_pio_sm_set_enabled_args se_args = {
@@ -1929,10 +2140,14 @@ void rp1_pio_close(struct rp1_pio_client *client)
 			struct dma_info *dma = &pio->dma_configs[i >> 1][i & 1];
 
 			claimed &= ~mask;
-			/* The SMs have been disabled, so this is safe */
-			if (!dma->tx)
-				rp1_pio_sm_dma_flush_rx(dma);
-			rp1_pio_sm_dma_free(dma);
+			mutex_lock(&dma->lock);
+			if (dma->chan) {
+				/* The SMs have been disabled, so this is safe */
+				if (!dma->tx)
+					rp1_pio_sm_dma_flush_rx(dma);
+				rp1_pio_sm_dma_free(dma);
+			}
+			mutex_unlock(&dma->lock);
 		}
 	}
 
@@ -2018,7 +2233,12 @@ static long rp1_pio_ioctl(struct file *filp, unsigned int ioctl_num,
 	ret = (hdlr->func)(client, argbuf);
 	dev_dbg(dev, "%s: %s -> %d\n", __func__, hdlr->name, ret);
 	if (ret > 0) {
-		if (copy_to_user(argp, argbuf, ret))
+		/*
+		 * A positive result is the number of bytes of the arguments
+		 * to return, but some handlers return a value instead (an SM
+		 * index, a byte count), so never copy more than was passed in.
+		 */
+		if (copy_to_user(argp, argbuf, min(ret, sz)))
 			ret = -EFAULT;
 	} else if (ret == -ERESTARTSYS && hdlr->restartable) {
 		/* Pass back the progress, so that a restart resumes from there */
@@ -2217,6 +2437,18 @@ static int rp1_pio_probe(struct platform_device *pdev)
 	pio->fw = fw;
 	spin_lock_init(&pio->lock);
 	mutex_init(&pio->instr_mutex);
+	for (i = 0; i < RP1_PIO_SMS_COUNT; i++) {
+		int dir;
+
+		for (dir = 0; dir < RP1_PIO_DIR_COUNT; dir++) {
+			struct dma_info *dma = &pio->dma_configs[i][dir];
+
+			mutex_init(&dma->lock);
+			/* the waitqueue and spinlock are only used by cyclic DMA */
+			init_waitqueue_head(&dma->cyclic_wait);
+			spin_lock_init(&dma->cyclic_lock);
+		}
+	}
 
 	p = devm_platform_get_and_ioremap_resource(pdev, 0, &ioresource);
 	if (IS_ERR(p)) {
